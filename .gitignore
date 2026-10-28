@@ -1,0 +1,9 @@
+.Rhistory
+.RData
+.Rproj.user/
+statcast_2025_daily/
+*.RDS
+*.rds
+
+/.quarto/
+**/*.quarto_ipynb

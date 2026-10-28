@@ -1,0 +1,19 @@
+2025 MLB early-count chase analysis
+Eligible pitches: 229974
+Outcome: swing on Statcast zone 11-14, with fewer than two strikes.
+Exclude automatic events, pitchouts, unknown pitch types, and missing tracking fields.
+DistanceOutside uses an approximate 0.83-ft horizontal half-width and recorded vertical boundaries.
+Development: before 2025-07-01; penalty tuning: 2025-07-01 to 2025-07-31; final evaluation: 2025-08-01 onward.
+Baseline and hitter-count models: ridge-penalized logistic regression (glmnet, alpha=0).
+Penalty grid: 1e-1 to 1e-7 (45 values), tuned on validation log-loss. standardize=FALSE; numeric covariates z-scored with development-period statistics.
+Hitter-count coefficients are shrunk; this is not a full hierarchical mixed-effects model.
+The hitter-count model is predictive, not causal. Pitcher identity and sequencing are not adjusted.
+Rankings compare predictions for the same representative pitch context (CH, R/R, median speed/distance).
+Ranking reference is equal-weight average across training-period hitters, not observed league chase rate.
+Rankings, eligibility (>=40 pitches) and observed rates use ONLY training-period pitches (before 2025-08-01).
+Eligible hitter-count cells: 1292 (412 hitters).
+TestOpportunities/TestRate columns are validation-only and are not used for fitting or eligibility.
+Selected top cells are extremes among many cells; estimates are optimistic even after shrinkage.
+No confidence intervals are claimed: ridge shrinkage is not a substitute for interval estimation.
+The August-September evaluation is retrospective: modelling choices were made with knowledge of the full season.
+Do not claim pitcher-adjusted or causal hitter vulnerability from this model.

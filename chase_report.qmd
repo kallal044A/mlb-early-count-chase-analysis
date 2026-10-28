@@ -1,0 +1,417 @@
+---
+title: "Which MLB hitters chase early in the count? A 2025 Statcast analysis"
+---
+
+::: {.callout-note}
+The contents have been reviewed and validated by Chad on October 27, 2026.
+
+
+
+
+
+:::
+
+# Setup
+
+The cells below load the data, run the full analysis script (`scripts/analysis.R`) and compute the numbers quoted in the summary. Running them takes a few minutes. By default the report treats the folder it sits in as the project and looks for the daily Statcast CSV files in a `statcast_2025_daily/` folder inside it; set the environment variables `CHASE_PROJECT_DIR` and `STATCAST_DAILY_DIR` to use other locations.
+
+```{r}
+#| label: load-packages
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(Matrix)
+library(glmnet)
+library(tibble)
+library(knitr)
+```
+
+```{r}
+#| label: load-data
+project_dir <- Sys.getenv(
+  "CHASE_PROJECT_DIR",
+  "."
+)
+daily_dir <- Sys.getenv(
+  "STATCAST_DAILY_DIR",
+  file.path(project_dir, "statcast_2025_daily")
+)
+
+daily_files <- list.files(daily_dir, pattern = "\\.csv$", full.names = TRUE)
+stopifnot(length(daily_files) > 0)
+
+statcast_2025 <- bind_rows(lapply(daily_files, function(f) {
+  read_csv(f, show_col_types = FALSE)
+})) |>
+  filter(game_type == "R")
+```
+
+```{r}
+#| label: run-analysis
+# Outputs go to a temporary folder so rendering leaves no files behind.
+Sys.setenv(CHASE_OUT_DIR = file.path(tempdir(), "chase_outputs"))
+analysis_log <- capture.output(
+  source(file.path(project_dir, "scripts", "analysis.R"), local = knitr::knit_global())
+)
+```
+
+```{r}
+#| label: key-metrics
+# Test-period pitches with the model's predictions, aligned to the test rows.
+test_pitches <- tibble(
+  batter = as.character(test$batter),
+  Count = as.character(test$Count),
+  y = y[idx_test],
+  pf = pred_full,
+  pb = pred_base
+)
+
+# Rank hitter-count cells using training data only, then cut into ten equal groups.
+assign_groups <- function(min_pitches) {
+  rankings |>
+    mutate(batter = as.character(batter), Count = as.character(Count)) |>
+    filter(TrainingOpportunities >= min_pitches) |>
+    arrange(desc(AdjustedDifferencePP)) |>
+    mutate(Group = ntile(row_number(), 10)) |>
+    select(batter, Count, Group)
+}
+
+test_cells <- test_pitches |>
+  inner_join(assign_groups(MIN_TRAINING_PITCHES), by = c("batter", "Count"))
+
+calib_groups <- test_cells |>
+  group_by(Group) |>
+  summarise(
+    Pitches = n(),
+    Predicted = mean(pf),
+    Observed = mean(y),
+    BaseModelPredicted = mean(pb),
+    .groups = "drop"
+  )
+
+top_group <- filter(calib_groups, Group == 1)
+bottom_group <- filter(calib_groups, Group == max(Group))
+
+# How much more than the pitch-only model predicts do top-ranked cells chase?
+top_lift <- mean((test_cells$y - test_cells$pb)[test_cells$Group == 1])
+bottom_lift <- mean((test_cells$y - test_cells$pb)[test_cells$Group == 10])
+lift_gap_pp <- 100 * (top_lift - bottom_lift)
+
+# Simple raw-rate alternatives, scored on the same test pitches.
+train_cells <- train |>
+  mutate(batter = as.character(batter), Count = as.character(Count)) |>
+  group_by(batter, Count) |>
+  summarise(n_train = n(), raw_cell_rate = mean(Chase), .groups = "drop") |>
+  filter(n_train >= MIN_TRAINING_PITCHES)
+train_hitters <- train |>
+  mutate(batter = as.character(batter)) |>
+  group_by(batter) |>
+  summarise(raw_hitter_rate = mean(Chase), n_hitter = n(), .groups = "drop")
+
+cmp_pitches <- test_pitches |>
+  inner_join(train_cells, by = c("batter", "Count")) |>
+  inner_join(train_hitters, by = "batter")
+league_rate_train <- mean(train$Chase)
+
+comparison <- tibble(
+  Approach = c(
+    "League average",
+    "Hitter's raw overall chase rate",
+    "Hitter's raw rate in that count",
+    "Pitch and count context only",
+    "Hitter-count model"
+  ),
+  LogLoss = c(
+    logloss(cmp_pitches$y, rep(league_rate_train, nrow(cmp_pitches))),
+    logloss(cmp_pitches$y, cmp_pitches$raw_hitter_rate),
+    logloss(cmp_pitches$y, cmp_pitches$raw_cell_rate),
+    logloss(cmp_pitches$y, cmp_pitches$pb),
+    logloss(cmp_pitches$y, cmp_pitches$pf)
+  )
+)
+
+# Overlap between the model's top hitters and a raw overall chase-rate list.
+top_hitters_model <- rankings |>
+  arrange(desc(AdjustedDifferencePP)) |>
+  distinct(batter) |>
+  slice_head(n = 20) |>
+  pull(batter) |>
+  as.character()
+top_hitters_raw <- train_hitters |>
+  filter(n_hitter >= 200) |>
+  arrange(desc(raw_hitter_rate)) |>
+  slice_head(n = 20) |>
+  pull(batter)
+top20_overlap <- length(intersect(top_hitters_model, top_hitters_raw))
+
+n_pitches <- nrow(raw)
+n_test <- length(idx_test)
+n_cells <- nrow(rankings)
+n_hitters <- n_distinct(rankings$batter)
+ll_league <- test_metrics$LogLoss[test_metrics$Model == "Training league rate"]
+ll_base <- test_metrics$LogLoss[test_metrics$Model == "Pitch-adjusted ridge"]
+ll_full <- test_metrics$LogLoss[test_metrics$Model == "Pitch + hitter-count ridge"]
+```
+
+# Summary
+
+**The question.** Before a hitter reaches two strikes, some swing at pitches Statcast classifies as outside the strike zone. Can we estimate which hitters do this more than others, and in which counts, in a way that holds up on pitches the model has not seen?
+
+**What I did.** I used `{r} format(n_pitches, big.mark = ",")` regular-season 2025 pitches that were outside the zone with fewer than two strikes. I built the hitter rankings from March through July data only, then tested them on `{r} format(n_test, big.mark = ",")` August and September pitches that were held back until the end.
+
+**What I found.**
+
+- Context explains a lot. A model that knows only the count, how far off the plate the pitch was, the pitch type and speed, and the handedness of the hitter and pitcher cuts prediction error (log-loss) from `{r} round(ll_league, 3)` to `{r} round(ll_base, 3)`, compared with predicting the league average for everyone.
+- Hitter-specific tendencies add a smaller but measurable improvement, to `{r} round(ll_full, 3)`.
+- The ranking carries forward. Among `{r} format(n_cells, big.mark = ",")` hitter-count cells (from `{r} n_hitters` hitters) that had at least `{r} MIN_TRAINING_PITCHES` pitches before August, the top-ranked tenth chased `{r} round(100 * top_group$Observed, 1)`% of the time in August and September, close to the `{r} round(100 * top_group$Predicted, 1)`% the model predicted. The bottom-ranked tenth chased `{r} round(100 * bottom_group$Observed, 1)`%, against a predicted `{r} round(100 * bottom_group$Predicted, 1)`%.
+- Controlling for what the pitch-only model would expect, the top-ranked tenth swung about `{r} round(lift_gap_pp, 0)` percentage points more often than the bottom-ranked tenth.
+
+**How much to trust it.** These are predictive, descriptive results for one season. They do not show why a hitter chases, and they do not account for who was pitching. See the limitations section.
+
+# The question and the data
+
+## Data
+
+Pitch-level Statcast data for the 2025 regular season came from daily files, `{r} format(nrow(statcast_2025), big.mark = ",")` pitches in total. I kept pitches that Statcast placed outside the zone (zones 11 to 14) with fewer than two strikes, and I removed automatic balls and strikes, pitchouts, unknown pitch types and rows missing tracking fields. That left `{r} format(n_pitches, big.mark = ",")` pitches.
+
+A **chase** is a swing at one of those pitches: a swinging strike, a foul ball, a foul tip, a bunt attempt or a ball put in play. Hit-by-pitch is treated as not a swing. Overall, `{r} round(100 * mean(raw$Chase), 1)`% of these pitches were chased.
+
+## Time-based split
+
+To avoid judging the model on information it already used, I split the season by date:
+
+```{r}
+#| label: split-table
+split_order <- c("development", "validation", "test")
+split_summary |>
+  mutate(Split = factor(Split, levels = split_order)) |>
+  arrange(Split) |>
+  transmute(
+    Period = c(
+      paste("Before", format(VALIDATION_START, "%b %d")),
+      paste(format(VALIDATION_START, "%b %d"), "to", format(TEST_START - 1, "%b %d")),
+      paste(format(TEST_START, "%b %d"), "onward")
+    ),
+    Role = c("Fit the models", "Choose the penalty strength", "Final test only"),
+    Pitches, ChaseRate = round(ChaseRate, 3), Batters
+  ) |>
+  kable()
+```
+
+# Method
+
+The model is a **ridge-penalized logistic regression** (`glmnet`). Logistic regression estimates the probability that a pitch is chased. The ridge penalty shrinks the estimates for hitters and counts with few pitches toward the average, so a lucky or unlucky small sample does not dominate the ranking.
+
+Two models were compared:
+
+1. **Pitch and context only.** Count, distance outside the zone (and its square), pitch type group, release speed, and the handedness of the hitter and pitcher.
+2. **Pitch, context and hitter-by-count.** Everything above, plus a separate term for each hitter in each count.
+
+The penalty strength was chosen on July pitches. The chosen models were then refit on March through July and scored once on August and September. Eligibility for the rankings (at least `{r} MIN_TRAINING_PITCHES` pitches in a hitter-count cell) and every rate shown in the rankings use only March through July pitches.
+
+Rankings compare hitters on the same reference pitch (a changeup, right-handed hitter and pitcher, median speed and distance), so differences reflect the hitter and not the kind of pitches he happened to see.
+
+# Results
+
+## How well does the model predict swings?
+
+```{r}
+#| label: fig-performance
+#| fig-cap: "Prediction error on held-out August and September pitches (log-loss, lower is better)."
+ggplot(test_metrics, aes(x = LogLoss, y = reorder(Model, -LogLoss))) +
+  geom_point(size = 3) +
+  labs(x = "Log-loss on held-out pitches", y = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+#| label: performance-table
+test_metrics |>
+  transmute(
+    Model,
+    Pitches = N,
+    `Log-loss` = round(LogLoss, 4),
+    `Brier score` = round(Brier, 4)
+  ) |>
+  kable()
+```
+
+The pitch-and-context model improves on the league average by `{r} round(ll_league - ll_base, 3)` in log-loss. The hitter-count model improves on the pitch-and-context model by a further `{r} round(ll_base - ll_full, 3)`. Most of what predicts a swing is the pitch and the situation, not who is batting.
+
+## Do the rankings hold up in later months?
+
+I ranked every eligible hitter-count cell using March through July data, split the ranking into ten equal groups, and compared what the model predicted for each group with what happened in August and September.
+
+```{r}
+#| label: fig-calibration
+#| fig-cap: "Predicted versus observed chase rate on August and September pitches, by decile of the March-July ranking. Points near the dashed line mean the predictions were accurate. The leftmost point is the lowest-ranked decile."
+axis_range <- range(c(calib_groups$Predicted, calib_groups$Observed)) + c(-0.02, 0.02)
+ggplot(calib_groups, aes(x = Predicted, y = Observed)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_point(size = 2.5) +
+  coord_equal(xlim = axis_range, ylim = axis_range) +
+  labs(
+    x = "Mean predicted chase probability",
+    y = "Observed chase rate"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+#| label: calibration-table
+calib_groups |>
+  transmute(
+    `Ranking decile (1 = most chase-prone)` = Group,
+    Pitches,
+    Predicted = round(Predicted, 3),
+    Observed = round(Observed, 3),
+    `Pitch-only model predicted` = round(BaseModelPredicted, 3)
+  ) |>
+  kable()
+```
+
+To put an uncertainty range on the top-versus-bottom gap, I resample hitters (not individual pitches), because pitches by the same hitter are not independent. I also repeat the check with stricter minimum-pitch cutoffs.
+
+```{r}
+#| label: bootstrap-gap
+set.seed(7316)
+
+boot_cutoff <- function(min_pitches, reps = 2000) {
+  groups <- assign_groups(min_pitches)
+  d <- test_pitches |>
+    inner_join(groups, by = c("batter", "Count")) |>
+    filter(Group %in% c(1, 10)) |>
+    mutate(Which = if_else(Group == 1, "top", "bottom"))
+
+  per_hitter <- d |>
+    group_by(batter, Which) |>
+    summarise(S = sum(y - pb), Sf = sum(y - pf), N = n(), .groups = "drop") |>
+    pivot_wider(names_from = Which, values_from = c(S, Sf, N), values_fill = 0)
+
+  gap <- function(w) {
+    sum(w * per_hitter$S_top) / sum(w * per_hitter$N_top) -
+      sum(w * per_hitter$S_bottom) / sum(w * per_hitter$N_bottom)
+  }
+  top_resid <- function(w) sum(w * per_hitter$Sf_top) / sum(w * per_hitter$N_top)
+
+  ones <- rep(1, nrow(per_hitter))
+  draws <- replicate(reps, {
+    w <- tabulate(sample.int(nrow(per_hitter), replace = TRUE), nrow(per_hitter))
+    c(gap(w), top_resid(w))
+  })
+
+  tibble(
+    MinPitches = min_pitches,
+    Cells = nrow(groups),
+    Hitters = n_distinct(groups$batter),
+    TopObserved = mean(d$y[d$Which == "top"]),
+    TopPredicted = mean(d$pf[d$Which == "top"]),
+    GapPP = 100 * gap(ones),
+    GapLow = 100 * quantile(draws[1, ], 0.025),
+    GapHigh = 100 * quantile(draws[1, ], 0.975),
+    TopMissPP = 100 * top_resid(ones),
+    MissLow = 100 * quantile(draws[2, ], 0.025),
+    MissHigh = 100 * quantile(draws[2, ], 0.975)
+  )
+}
+
+cutoff_results <- bind_rows(lapply(c(MIN_TRAINING_PITCHES, 60, 100), boot_cutoff))
+```
+
+```{r}
+#| label: cutoff-table
+cutoff_results |>
+  transmute(
+    `Min. training pitches` = MinPitches,
+    Cells, Hitters,
+    `Top decile observed` = round(TopObserved, 3),
+    `Top decile predicted` = round(TopPredicted, 3),
+    `Top vs bottom gap, pp (95% interval)` = sprintf("%.1f (%.1f to %.1f)", GapPP, GapLow, GapHigh),
+    `Top decile observed minus predicted, pp (95% interval)` = sprintf("%.1f (%.1f to %.1f)", TopMissPP, MissLow, MissHigh)
+  ) |>
+  kable()
+```
+
+At the default cutoff of `{r} MIN_TRAINING_PITCHES` pitches, the top-ranked tenth chased `{r} round(cutoff_results$GapPP[1], 1)` percentage points more than the bottom-ranked tenth, beyond what the pitch-only model expects (95% interval `{r} sprintf("%.1f", cutoff_results$GapLow[1])` to `{r} sprintf("%.1f", cutoff_results$GapHigh[1])`). The table shows how this changes with stricter cutoffs.
+
+## Which hitters and counts does the model flag?
+
+```{r}
+#| label: top-cells-table
+scouting_shortlist |>
+  slice_head(n = 10) |>
+  transmute(
+    Player, Count,
+    `Training pitches` = TrainingOpportunities,
+    `Raw training chase rate` = round(TrainingRate, 3),
+    `Model estimate (reference pitch)` = round(AdjustedProbability, 3),
+    `Typical hitter in this count` = round(ReferenceAverage, 3),
+    `Difference, pp` = round(AdjustedDifferencePP, 1),
+    `Aug-Sep pitches` = TestOpportunities,
+    `Aug-Sep chase rate` = round(TestRate, 3)
+  ) |>
+  kable()
+```
+
+The model estimate is for the reference pitch, so it is not directly comparable to a hitter's raw rate, which reflects the pitches he actually saw. Each cell also has only a few dozen August and September pitches, so single-cell results are noisy. The group-level check above is the stronger evidence.
+
+```{r}
+#| label: fig-top-cells
+#| fig-cap: "The 20 hitter-count cells with the largest model-adjusted difference from the typical hitter in the same count, among cells with enough March-July pitches."
+#| fig-height: 7
+p_top
+```
+
+```{r}
+#| label: fig-heatmap
+#| fig-cap: "Model-adjusted difference from the typical hitter, by count, for the 20 highest-ranked hitters."
+#| fig-height: 7
+p_heat
+```
+
+The same hitters often appear in several counts. This is expected: the model has no separate hitter-level term, so a hitter who chases a lot overall can show up high in every count.
+
+## Is this better than a simple chase-rate list?
+
+```{r}
+#| label: comparison-table
+comparison |>
+  mutate(`Log-loss` = round(LogLoss, 3)) |>
+  select(Approach, `Log-loss`) |>
+  kable()
+```
+
+All approaches are scored on the same `{r} format(nrow(cmp_pitches), big.mark = ",")` August and September pitches from eligible hitter-count cells. A hitter's raw chase rate is only a small improvement on the league average, because it ignores how far off the plate the pitches were, the pitch type and the count. The context-only model does much better, and adding hitter-specific, shrunk estimates improves it further. `{r} top20_overlap` of the model's top 20 hitters also appear in the top 20 by raw overall chase rate (hitters with at least 200 March-July pitches), so the practical value of the model lies in the count-by-count estimates and in the adjustment for pitch context, more than in discovering unfamiliar names.
+
+# Using this for scouting
+
+What the results support:
+
+- Comparing hitters on how likely they are to expand the zone in a given count, relative to other hitters in that count, for counts with enough pitches (mainly 0-0, 0-1, 1-0 and 1-1).
+- Treating the top of the list as leads to investigate. The held-out check shows that, for groups of cells, the estimates were accurate rather than overstated.
+
+What they do not support yet:
+
+- **Pitch-specific advice.** Every hitter is scored on a single reference pitch (a changeup, right-handed matchup). The model does not know whether a hitter chases sliders, or pitches low and away, more than fastballs.
+- **What happens after the swing.** The outcome is a swing, not a whiff or weak contact. A chase that turns into hard contact is not an advantage for the pitcher.
+- **Within-hitter patterns.** The comparison is with other hitters in the same count. It does not say in which counts a given hitter chases more than he does in other counts.
+- **Left-handed pitchers.** The reference matchup is right-handed against right-handed.
+
+# Limitations
+
+- **Descriptive and predictive, not causal.** The model shows who tends to swing at pitches outside the zone, not why.
+- **Pitcher, sequencing and park are not adjusted.** Hitters face different pitchers and pitch sequences, which can look like hitter tendencies.
+- **Location is approximate.** Distance outside the zone uses a fixed half-width of `{r} PLATE_HALF_WIDTH_FT` feet and each pitch's recorded top and bottom of the zone. It does not distinguish inside from outside relative to the hitter's side.
+- **One season, with retrospective choices.** I made modeling decisions while knowing the full season, and I looked at the held-out results while refining the penalty settings. The August and September check is therefore a retrospective evaluation, not a prospective test.
+- **Extremes are optimistic.** The shortlist takes the highest cells out of `{r} format(n_cells, big.mark = ",")` eligible cells. The shrinkage and the calibration check suggest the overstatement is small here, but individual estimates remain uncertain, and the ridge model does not provide interval estimates for single hitters.
+- **Small samples.** A hitter has relatively few off-zone pitches in any one count. The minimum of `{r} MIN_TRAINING_PITCHES` pitches is a judgement call, and the cutoff table shows the main conclusion is not sensitive to it.
+- **Modest gains from hitter information.** The improvement from adding hitter-by-count terms is real but small in absolute terms.
+- **Coverage.** Counts with two strikes are excluded by design, and counts such as 2-0, 3-0 and 3-1 have too few qualifying pitches to appear in the rankings.
+
+# Reproducibility
+
+- Data: MLB Statcast pitch-level data for the 2025 regular season, read from daily CSV files (`statcast_2025_daily`), `{r} length(daily_files)` files in this run.
+- Code: `scripts/analysis.R` (data preparation, modeling and rankings) and this document (checks and figures).
+- Software: `{r} R.version.string`, `glmnet` `{r} as.character(packageVersion("glmnet"))`.
+- The analysis uses no random sampling. The bootstrap intervals above use a fixed random seed.
