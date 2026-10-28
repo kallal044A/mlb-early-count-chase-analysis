@@ -80,4 +80,6 @@ The code requires R and the packages `dplyr`, `tidyr`, `ggplot2`, `readr`, `Matr
 
 To render the report, place the daily Statcast CSV files (one per game date, e.g. `2025-03-18.csv`) in a `statcast_2025_daily/` folder in the project root, then render `chase_report.qmd` with Quarto. To keep the data elsewhere, set the environment variable `STATCAST_DAILY_DIR` to that folder (and `CHASE_PROJECT_DIR` if you render from outside the project folder). Rendering takes a few minutes.
 
+License: code and documentation are released under the [MIT License](LICENSE). MLB Statcast data is not included and remains subject to its own terms.
+
 Data source: MLB Statcast, accessed using the R `baseballr` package. This is an independent research/portfolio project, not an official MLB or St. Louis Cardinals publication.
